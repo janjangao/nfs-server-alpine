@@ -34,7 +34,7 @@ else
 fi
 
 # Check if the READ_ONLY variable is set (rather than a null string) using parameter expansion
-if [ -z ${READ_ONLY+y} ]; then
+if [ -z "${READ_ONLY+y}" ]; then
   echo "The READ_ONLY environment variable is unset or null, defaulting to 'rw'."
   echo "Clients have read/write access."
   SET_OPTS=rw
@@ -44,15 +44,21 @@ else
   SET_OPTS=ro
 fi
 
-# Check if the SYNC variable is set (rather than a null string) using parameter expansion
-if [ -z "${SYNC+y}" ]; then
-  echo "The SYNC environment variable is unset or null, defaulting to 'async' mode".
-  echo "Writes will not be immediately written to disk."
-  SET_OPTS=${SET_OPTS},async
-else
-  echo "The SYNC environment variable is set, using 'sync' mode".
+# Check if the ASYNC variable is set (rather than a null string) using parameter expansion
+if [ -z "${ASYNC+y}" ]; then
+  echo "The ASYNC environment variable is unset or null, defaulting to 'sync' mode."
   echo "Writes will be immediately written to disk."
   SET_OPTS=${SET_OPTS},sync
+else
+  echo "The ASYNC environment variable is set, using 'async' mode."
+  echo "Writes will not be immediately written to disk."
+  SET_OPTS=${SET_OPTS},async
+fi
+
+# Check if the CROSSMNT variable is set (rather than a null string) using parameter expansion
+if [ -n "${CROSSMNT+y}" ]; then
+  echo "The CROSSMNT environment variable is set, allowing crossmounts."
+  SET_OPTS=${SET_OPTS},crossmnt
 fi
 
 # if NFS_OPTS is not set
@@ -60,32 +66,80 @@ fi
 if [ -z "${NFS_OPTS}" ]; then
   echo "NFS_OPTS has not been defined. Adding default parameters"
   # set default options from legacy approach
-  DEFAULT_OPTS=fsid=0,no_subtree_check,no_auth_nlm,insecure,no_root_squash
+  DEFAULT_OPTS=no_subtree_check,no_auth_nlm,insecure,no_root_squash
   
   # Build opts string
   opts=${SET_OPTS},${DEFAULT_OPTS}
 else
 
   # Otherwise use NFS_OPTS directly
-  echo "NFS_OPTS has been defined. Disregarding READ_ONLY,SYNC, and default parameters"
+  echo "NFS_OPTS has been defined. Disregarding READ_ONLY,ASYNC,CROSSMNT, and default parameters"
 
   # Build opts string
   opts=${NFS_OPTS}
 fi;
 
 # Check if the SHARED_DIRECTORY variable is empty
-if [ ! -z "${SHARED_DIRECTORY}" ]; then
-  echo "SHARED_DIRECTORY is set. Please use CMD instead"
+if [ -n "${SHARED_DIRECTORY}" ]; then
+  echo "SHARED_DIRECTORY is set. Please use CMD instead if need multiple directories support"
+  if [[ "$SHARED_DIRECTORY" != *:* ]]; then
+    SHARED_DIRECTORY="${SHARED_DIRECTORY}:fsid=0"
+  fi
   echo "Adding SHARED_DIRECTORY to CMD input"
   mounts[${#mounts[@]}]=$SHARED_DIRECTORY
 fi
 
-for mnt in "${mounts[@]}"; do
-  echo "Setting up exports for mount: $mnt"
-  src=$(echo $mnt | awk -F':' '{ print $1 }')
-  mkdir -p $src
-  echo "$src ${PERMITTED}($opts)" >> /etc/exports
+# Add SHARED_DIRECTORY_N to CMD input
+mapfile -t __sd_vars < <(
+  compgen -A variable | grep -E '^SHARED_DIRECTORY_[0-9]+$' | sort -V 2>/dev/null
+)
+for __name in "${__sd_vars[@]}"; do
+  __val="${!__name}"
+  [[ -n "$__val" ]] || continue
+  echo "Adding ${__name} to CMD input"
+  mounts+=("$__val")
 done
+unset __sd_vars __name __val
+
+# Clear the exports file
+: > /etc/exports
+
+for __mnt in "${mounts[@]}"; do
+  echo "Setting up exports for mount: $__mnt"
+  __src=${__mnt%%:*}
+  __extra=${__mnt#*:}
+  if [ "$__src" = "$__extra" ]; then
+    __extra=""
+  fi
+  mkdir -p "$__src"
+  if [ -n "$__extra" ]; then
+    echo "$__src ${PERMITTED}($opts,$__extra)" >> /etc/exports
+  else
+    echo "$__src ${PERMITTED}($opts)" >> /etc/exports
+  fi
+done
+unset __mnt __src __extra
+
+# Also append explicit NFS_EXPORT_N lines (verbatim) to /etc/exports
+mapfile -t __nfs_export_vars < <(
+  compgen -A variable | grep -E '^NFS_EXPORT_[0-9]+$' | sort -V 2>/dev/null
+)
+for __name in "${__nfs_export_vars[@]}"; do
+  __line="${!__name}"
+  [[ -n "$__line" ]] || continue
+
+  echo "Adding ${__name} to /etc/exports"
+
+  # Ensure the exported directory exists (first whitespace-delimited token)
+  __path="${__line%%[[:space:]]*}"
+  if [[ -n "$__path" && "$__path" == /* ]]; then
+    mkdir -p "$__path"
+  fi
+
+  # Append the line verbatim to /etc/exports
+  echo "$__line" >> /etc/exports
+done
+unset __nfs_export_vars __name __line __path
 
 # Partially set 'unofficial Bash Strict Mode' as described here: http://redsymbol.net/articles/unofficial-bash-strict-mode/
 # We don't set -e because the pidof command returns an exit code of 1 when the specified process is not found
@@ -118,7 +172,7 @@ while true; do
     # /usr/sbin/rpc.statd
 
     echo "Starting NFS in the background..."
-    /usr/sbin/rpc.nfsd --debug 8 --no-udp --no-nfs-version 2 --no-nfs-version 3
+    /usr/sbin/rpc.nfsd --debug 8 --no-udp --no-nfs-version 3
     echo "Exporting File System..."
     if /usr/sbin/exportfs -rv; then
       /usr/sbin/exportfs
@@ -126,8 +180,8 @@ while true; do
       echo "Export validation failed, exiting..."
       exit 1
     fi
-    echo "Starting Mountd in the background..."These
-    /usr/sbin/rpc.mountd --debug all --no-udp --no-nfs-version 2 --no-nfs-version 3
+    echo "Starting Mountd in the background..."
+    /usr/sbin/rpc.mountd --debug all --no-udp --no-nfs-version 3
 # --exports-file /etc/exports
 
     # Check if NFS is now running by recording its PID (if it is not running $pid will be null):
