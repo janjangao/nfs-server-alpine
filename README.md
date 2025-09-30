@@ -42,7 +42,11 @@ services:
       - "2049:2049" 
     volumes:
         - /storage:/storage
-        - /media:/storage/media
+        - type: bind 
+          source: /media 
+          target: /storage/media
+          bind: 
+            propagation: rslave
     restart: unless-stopped
 
 ```
